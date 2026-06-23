@@ -37,6 +37,35 @@ class _Outer(eqx.Module):
         self.cursor = 0
 
 
+class _Acc(eqx.Module):
+    """A carry-friendly module: all-array leaves, no static fields."""
+
+    buf: jax.Array
+    total: jax.Array
+
+    def __init__(self, n: int):
+        self.buf = jnp.zeros(n)
+        self.total = jnp.zeros(())
+
+
+class _MLP(eqx.Module):
+    w1: jax.Array
+    b1: jax.Array
+    w2: jax.Array
+    b2: jax.Array
+
+    def __init__(self, key, in_dim: int = 784, hidden: int = 32, out: int = 10):
+        k1, k2 = jr.split(key)
+        self.w1 = jr.normal(k1, (in_dim, hidden)) / jnp.sqrt(in_dim)
+        self.b1 = jnp.zeros(hidden)
+        self.w2 = jr.normal(k2, (hidden, out)) / jnp.sqrt(hidden)
+        self.b2 = jnp.zeros(out)
+
+    def __call__(self, x):
+        h = jax.nn.relu(x @ self.w1 + self.b1)
+        return h @ self.w2 + self.b2
+
+
 def _is_frozen(mod, attr) -> bool:
     """True if assigning `attr` on `mod` raises (i.e. it is a frozen Module)."""
     try:
@@ -267,3 +296,140 @@ def test_exception_safety():
         nb2.cursor = 1
     assert int(nb2.cursor) == 1 and type(nb2) is _Buf
     assert _is_frozen(nb2, "cursor")
+
+
+def test_under_scan():
+    # carry a module through lax.scan, mutating its buffer each step
+    def step(carry, xs):
+        i, v = xs
+        with copy_and_mutate(carry) as nc:
+            nc.buf = nc.buf.at[i].set(v)
+            nc.total = nc.total + v
+        return nc, nc.total
+
+    acc = _Acc(4)
+    idxs = jnp.arange(4)
+    vals = jnp.array([10.0, 20.0, 30.0, 40.0])
+    final, totals = jax.lax.scan(step, acc, (idxs, vals))
+
+    assert type(final) is _Acc
+    assert [float(x) for x in final.buf] == [10.0, 20.0, 30.0, 40.0]
+    assert float(final.total) == 100.0
+    # the per-step outputs were collected as the running total
+    assert [float(t) for t in totals] == [10.0, 30.0, 60.0, 100.0]
+    assert _is_frozen(final, "total")
+
+
+def test_under_cond():
+    def inc(b):
+        with copy_and_mutate(b) as nb:
+            nb.x = nb.x + 1.0
+        return nb
+
+    def dec(b):
+        with copy_and_mutate(b) as nb:
+            nb.x = nb.x - 1.0
+        return nb
+
+    b = _Buf(3)  # x starts at zeros
+    up = jax.lax.cond(True, inc, dec, b)
+    down = jax.lax.cond(False, inc, dec, b)
+
+    assert type(up) is _Buf and type(down) is _Buf
+    assert float(up.x[0]) == 1.0
+    assert float(down.x[0]) == -1.0
+    # both branches mutate but leave a frozen module behind
+    assert _is_frozen(up, "x") and _is_frozen(down, "x")
+
+
+def test_under_switch():
+    def make(delta):
+        def branch(b):
+            with copy_and_mutate(b) as nb:
+                nb.x = nb.x + delta
+            return nb
+
+        return branch
+
+    branches = [make(1.0), make(2.0), make(3.0)]
+    b = _Buf(3)
+    for idx in range(3):
+        out = jax.lax.switch(idx, branches, b)
+        assert type(out) is _Buf
+        assert float(out.x[0]) == float(idx + 1)
+
+
+def test_select_inside_block():
+    # branchless selection (jnp.where) on a mutable copy inside the block
+    b = _Buf(3)
+    with copy_and_mutate(b) as nb:
+        nb.x = jnp.where(jnp.array(True), nb.x + 5.0, nb.x - 5.0)
+    assert float(nb.x[0]) == 5.0
+    with copy_and_mutate(b) as nb2:
+        nb2.x = jnp.where(jnp.array(False), nb2.x + 5.0, nb2.x - 5.0)
+    assert float(nb2.x[0]) == -5.0
+
+
+def test_cond_under_vmap():
+    # a per-example branch inside vmap: jax lowers cond to a select, and each
+    # lane must still come back as a properly frozen module
+    def f(b, pred):
+        def inc(b):
+            with copy_and_mutate(b) as nb:
+                nb.x = nb.x + 1.0
+            return nb
+
+        def dec(b):
+            with copy_and_mutate(b) as nb:
+                nb.x = nb.x - 1.0
+            return nb
+
+        return jax.lax.cond(pred, inc, dec, b)
+
+    bs = jax.tree.map(lambda *x: jnp.stack(x), *[_Buf(3) for _ in range(3)])
+    preds = jnp.array([True, False, True])
+    out = eqx.filter_vmap(f)(bs, preds)
+
+    assert type(out) is _Buf
+    assert out.x.shape == (3, 3)
+    assert [float(out.x[k, 0]) for k in range(3)] == [1.0, -1.0, 1.0]
+    assert _is_frozen(out, "x")
+
+
+def test_mnist_training_steps():
+    # a few steps of SGD on synthetic, MNIST-shaped data, where the parameter
+    # update is expressed as a copy_and_mutate edit of the model
+    n, in_dim, n_cls = 128, 784, 10
+    key = jr.key(0)
+    dkey, wkey, mkey = jr.split(key, 3)
+    X = jr.normal(dkey, (n, in_dim))
+    W_true = jr.normal(wkey, (in_dim, n_cls))
+    Y = jnp.argmax(X @ W_true, axis=1)  # a learnable labelling
+
+    model = _MLP(mkey, in_dim=in_dim, hidden=32, out=n_cls)
+
+    def loss_fn(m, xb, yb):
+        logits = jax.vmap(m)(xb)
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        return -jnp.mean(logp[jnp.arange(yb.shape[0]), yb])
+
+    @eqx.filter_jit
+    def train_step(m, xb, yb, lr):
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(m, xb, yb)
+        # shape/dtype-preserving update -> default validation passes
+        with copy_and_mutate(m) as nm:
+            nm.w1 = nm.w1 - lr * grads.w1
+            nm.b1 = nm.b1 - lr * grads.b1
+            nm.w2 = nm.w2 - lr * grads.w2
+            nm.b2 = nm.b2 - lr * grads.b2
+        return nm, loss
+
+    losses = []
+    for _ in range(30):
+        model, loss = train_step(model, X, Y, 0.3)
+        losses.append(float(loss))
+
+    assert type(model) is _MLP
+    assert all(jnp.isfinite(jnp.array(losses)))  # training stayed numerically sane
+    assert losses[-1] < losses[0]  # and the loss actually went down
+    assert _is_frozen(model, "w1")
