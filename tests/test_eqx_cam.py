@@ -66,6 +66,32 @@ class _MLP(eqx.Module):
         return h @ self.w2 + self.b2
 
 
+# A 3-deep nest used by the nested-construction tests below.
+class _L1(eqx.Module):
+    a: jax.Array
+
+    def __init__(self, n: int):
+        self.a = jnp.zeros(n)
+
+
+class _L2(eqx.Module):
+    l1: _L1
+    b: jax.Array
+
+    def __init__(self, n: int):
+        self.l1 = _L1(n)
+        self.b = jnp.ones(n)
+
+
+class _L3(eqx.Module):
+    l2: _L2
+    c: jax.Array
+
+    def __init__(self, n: int):
+        self.l2 = _L2(n)
+        self.c = jnp.full((n,), 2.0)
+
+
 def _is_frozen(mod, attr) -> bool:
     """True if assigning `attr` on `mod` raises (i.e. it is a frozen Module)."""
     try:
@@ -73,6 +99,13 @@ def _is_frozen(mod, attr) -> bool:
         return False
     except Exception:
         return True
+
+
+def _writable_count() -> int:
+    """How many instances are currently in Equinox's writability set."""
+    from eqx_cam.cam import _eqx_writable
+
+    return len(_eqx_writable._dict)
 
 
 def test_flat_mutation():
@@ -433,3 +466,444 @@ def test_mnist_training_steps():
     assert all(jnp.isfinite(jnp.array(losses)))  # training stayed numerically sane
     assert losses[-1] < losses[0]  # and the loss actually went down
     assert _is_frozen(model, "w1")
+
+
+def test_structure_stable_while_mutable():
+    # the mutable copy must keep the original's pytree structure *inside* the
+    # block (it is the same class, not a mutable subclass)
+    mlp = eqx.nn.MLP(2, 2, 8, 2, key=jr.key(0))
+    with copy_and_mutate(mlp) as m:
+        assert type(m) is type(mlp)
+        assert jax.tree.structure(m) == jax.tree.structure(mlp)
+        m.layers[0].weight = m.layers[0].weight.at[0, 0].set(1.0)
+        # still matches after an edit
+        assert jax.tree.structure(m) == jax.tree.structure(mlp)
+
+
+def test_optax_compatible_in_block():
+    # the original bug: a mutable MLP must tree-map against pytrees built from
+    # the *original* MLP (gradients / updates / optimizer state) while still
+    # inside the with-block. A mutable-subclass copy would fail this.
+    mlp = eqx.nn.MLP(2, 2, 8, 2, key=jr.key(0))
+    grads = jax.tree.map(lambda x: jnp.ones_like(x) if eqx.is_array(x) else x, mlp)
+    with copy_and_mutate(mlp) as m:
+        m.layers[0].weight = m.layers[0].weight.at[0, 0].set(1.0)
+        # optax-style: tree_map over (updates_from_original, mutable_params)
+        merged = jax.tree.map(
+            lambda _g, p: p,
+            eqx.filter(grads, eqx.is_array),
+            eqx.filter(m, eqx.is_array),
+        )
+        assert jax.tree.structure(merged) == jax.tree.structure(
+            eqx.filter(mlp, eqx.is_array)
+        )
+        # eqx.apply_updates (sgd-style) also works in-block
+        updates = jax.tree.map(lambda x: -0.1 * x if eqx.is_array(x) else None, grads)
+        stepped = eqx.apply_updates(m, updates)
+        assert type(stepped) is type(mlp)
+
+
+def test_no_leaked_writability():
+    # after the block nothing stays writable (and the writability set is unwound)
+    from eqx_cam.cam import _eqx_writable
+
+    mlp = eqx.nn.MLP(2, 2, 8, 2, key=jr.key(0))
+    before = len(_eqx_writable._dict)
+    with copy_and_mutate(mlp) as m:
+        m.layers[0].weight = m.layers[0].weight.at[0, 0].set(1.0)
+    assert len(_eqx_writable._dict) == before  # nothing left behind
+    assert _is_frozen(m, "depth")
+    assert _is_frozen(m.layers[0], "weight")
+
+
+def test_nested_copy_and_mutate_same_tree():
+    # an inner copy_and_mutate over the outer mutable copy must not freeze the
+    # outer one early: each call only ever touches its own fresh copy's instances
+    o = _Outer(3)
+    with copy_and_mutate(o) as a:
+        a.cursor = 1
+        with copy_and_mutate(a) as b:
+            b.cursor = 2
+        assert int(b.cursor) == 2 and _is_frozen(b, "cursor")
+        # `a` is still writable after the inner block exits
+        a.inner.w = a.inner.w.at[0].set(9.0)
+    assert int(a.cursor) == 1 and float(a.inner.w[0]) == 9.0
+    assert _is_frozen(a, "cursor") and _is_frozen(a.inner, "w")
+
+
+def test_inside_init():
+    # using copy_and_mutate during another module's __init__ (when that module
+    # is itself in Equinox's writability set) must not corrupt the set: the
+    # enclosing module still freezes correctly once its __init__ returns
+    from eqx_cam.cam import _eqx_writable
+
+    before = len(_eqx_writable._dict)
+
+    class Wraps(eqx.Module):
+        inner: _Buf
+        tag: int
+
+        def __init__(self, src):
+            with copy_and_mutate(src) as m:
+                m.cursor = 7
+            self.inner = m
+            self.tag = 1
+
+    w = Wraps(_Buf(3))
+    assert int(w.inner.cursor) == 7
+    assert type(w) is Wraps and type(w.inner) is _Buf
+    # the enclosing module and its child are frozen after construction
+    assert _is_frozen(w, "tag") and _is_frozen(w.inner, "cursor")
+    assert len(_eqx_writable._dict) == before  # set fully unwound
+
+
+# --------------------------------------------------------------------------- #
+# Weirder nested constructions: __init__ × copy_and_mutate at several depths,  #
+# with combinations that should and should not error.                         #
+# --------------------------------------------------------------------------- #
+
+
+def test_deep_simultaneous_edits():
+    # edit leaves at all three depths in one block; everything re-freezes
+    base = _writable_count()
+    o = _L3(3)
+    orig_a = o.l2.l1.a
+    with copy_and_mutate(o) as m:
+        m.c = m.c + 1.0
+        m.l2.b = m.l2.b * 2.0
+        m.l2.l1.a = m.l2.l1.a.at[0].set(9.0)
+    assert float(m.c[0]) == 3.0
+    assert float(m.l2.b[0]) == 2.0
+    assert float(m.l2.l1.a[0]) == 9.0
+    # original untouched and not aliased at any depth
+    assert float(orig_a[0]) == 0.0 and m.l2.l1.a is not o.l2.l1.a
+    assert _is_frozen(m, "c") and _is_frozen(m.l2, "b") and _is_frozen(m.l2.l1, "a")
+    assert _writable_count() == base
+
+
+def test_triple_nested_blocks():
+    # three nested copy_and_mutate over the same (progressively copied) tree;
+    # each inner exit must leave the enclosing copy writable, all re-freeze
+    base = _writable_count()
+    o = _L3(3)
+    with copy_and_mutate(o) as a:
+        a.c = a.c + 1.0
+        with copy_and_mutate(a) as b:
+            b.l2.b = b.l2.b + 1.0
+            with copy_and_mutate(b) as c:
+                c.l2.l1.a = c.l2.l1.a + 1.0
+            assert _is_frozen(c, "c")
+            # `b` still writable after the innermost block closed
+            b.l2.l1.a = b.l2.l1.a + 5.0
+        assert _is_frozen(b, "c")
+        # `a` still writable after the middle block closed
+        a.l2.b = a.l2.b + 10.0
+    assert float(a.c[0]) == 3.0 and float(a.l2.b[0]) == 11.0
+    assert _is_frozen(a, "c") and _is_frozen(a.l2.l1, "a")
+    assert _writable_count() == base
+
+
+def test_cam_in_init_assigns_module_field():
+    # __init__ uses copy_and_mutate and stores the *module* it produced
+    base = _writable_count()
+
+    class Inner(eqx.Module):
+        buf: _L1
+
+        def __init__(self, src: _L1):
+            with copy_and_mutate(src) as m:
+                m.a = m.a.at[0].set(10.0)
+            self.buf = m  # a frozen _L1, produced by cam during __init__
+
+    class Outer(eqx.Module):
+        inner: Inner
+        w: jax.Array
+
+        def __init__(self, src: _L1):
+            self.inner = Inner(src)  # nested __init__ also runs cam
+            with copy_and_mutate(src) as m2:
+                m2.a = m2.a + 1.0
+            self.w = m2.a
+
+    out = Outer(_L1(3))
+    assert float(out.inner.buf.a[0]) == 10.0
+    assert float(out.w[0]) == 1.0
+    assert type(out.inner.buf) is _L1
+    assert _is_frozen(out, "w") and _is_frozen(out.inner.buf, "a")
+    assert _writable_count() == base
+
+
+def test_construct_module_inside_block():
+    # constructing a fresh Equinox module inside the block interleaves Equinox's
+    # own add/remove with ours; the fresh module must end frozen and our copy
+    # must stay writable, with the set fully unwound afterwards
+    base = _writable_count()
+    o = _L2(3)
+    with copy_and_mutate(o) as m:
+        fresh = _L1(3)
+        assert _is_frozen(fresh, "a")  # Equinox froze it on construction
+        m.l1.a = m.l1.a + fresh.a + 1.0
+        m.b = m.b * 2.0  # our copy is still writable afterwards
+    assert float(m.l1.a[0]) == 1.0 and float(m.b[0]) == 2.0
+    assert _is_frozen(m.l1, "a") and _is_frozen(m, "b")
+    assert _writable_count() == base
+
+
+def test_aliased_submodule_is_de_aliased():
+    # the same submodule instance held in two fields becomes two independent
+    # copies; editing one must not touch the other, and freezing visits the
+    # (now-duplicated) node without a double-remove error
+    base = _writable_count()
+
+    class Dup(eqx.Module):
+        x: _L1
+        y: _L1
+
+        def __init__(self, shared: _L1):
+            self.x = shared
+            self.y = shared
+
+    shared = _L1(3)
+    d = Dup(shared)
+    assert d.x is d.y  # aliased in the original
+    with copy_and_mutate(d) as nd:
+        assert nd.x is not nd.y  # de-aliased in the copy
+        nd.x.a = nd.x.a.at[0].set(5.0)
+    assert float(nd.x.a[0]) == 5.0 and float(nd.y.a[0]) == 0.0
+    assert _is_frozen(nd.x, "a") and _is_frozen(nd.y, "a")
+    assert _writable_count() == base
+
+
+def test_exception_in_nested_block_unwinds_all_levels():
+    # an exception raised in the innermost of nested blocks must unwind the
+    # writability set at every level and leave the original untouched
+    base = _writable_count()
+    o = _L3(3)
+    captured = {}
+    try:
+        with copy_and_mutate(o) as a:
+            captured["a"] = a
+            with copy_and_mutate(a) as b:
+                captured["b"] = b
+                b.l2.l1.a = b.l2.l1.a + 1.0
+                raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert _writable_count() == base  # both levels unwound
+    assert _is_frozen(captured["a"], "c") and _is_frozen(captured["b"], "c")
+    assert float(o.l2.l1.a[0]) == 0.0  # original survives
+
+
+def test_deep_validation_errors():
+    # shape, dtype, and structure changes deep in the tree all error by default,
+    # and the leaf-level messages point at the offending path
+    o = _L3(3)
+
+    raised = ""
+    try:
+        with copy_and_mutate(o) as m:
+            m.l2.l1.a = jnp.zeros(9)  # deep shape change
+    except ValueError as e:
+        raised = str(e)
+    assert ".l2.l1.a" in raised
+
+    raised = ""
+    try:
+        with copy_and_mutate(o) as m:
+            m.l2.l1.a = m.l2.l1.a.astype(jnp.int32)  # deep dtype change
+    except ValueError as e:
+        raised = str(e)
+    assert ".l2.l1.a" in raised
+
+    structural = False
+    try:
+        with copy_and_mutate(o) as m:
+            m.l2.l1 = jnp.zeros(3)  # type: ignore[assignment]  # module -> array, deep
+    except ValueError:
+        structural = True
+    assert structural
+
+
+def test_deep_shape_change_allowed_with_flag():
+    # the same deep shape change is fine when validation is disabled
+    base = _writable_count()
+    o = _L3(3)
+    with copy_and_mutate(o, validate=False) as m:
+        m.l2.l1.a = jnp.zeros(9)
+    assert m.l2.l1.a.shape == (9,)
+    assert o.l2.l1.a.shape == (3,)  # original untouched
+    assert _is_frozen(m.l2.l1, "a")
+    assert _writable_count() == base
+
+
+def test_dict_structure_change_errors_but_value_edit_ok():
+    # mutating a dict-valued field: changing keys is a structure change (errors),
+    # editing values in place with matching keys/shapes is fine
+    class Hold(eqx.Module):
+        d: dict
+
+        def __init__(self):
+            self.d = {"a": jnp.zeros(2)}
+
+    h = Hold()
+    raised = False
+    try:
+        with copy_and_mutate(h) as nh:
+            nh.d = {"a": jnp.zeros(2), "b": jnp.zeros(2)}  # added key
+    except ValueError:
+        raised = True
+    assert raised
+
+    with copy_and_mutate(h) as nh:
+        nh.d["a"] = nh.d["a"].at[0].set(3.0)  # same keys/shape, in place
+    assert float(nh.d["a"][0]) == 3.0
+    assert float(h.d["a"][0]) == 0.0  # original untouched
+
+
+# --------------------------------------------------------------------------- #
+# Field kinds and semantic contracts: static fields, invariant checks,        #
+# converters, scalar promotion, inheritance, and degenerate modules.          #
+# --------------------------------------------------------------------------- #
+
+
+def test_static_field_change_errors():
+    # a static field lives in the treedef, so reassigning it is a structure
+    # change and is rejected by default validation
+    class WithStatic(eqx.Module):
+        x: jax.Array
+        name: str = eqx.field(static=True)
+
+        def __init__(self, n):
+            self.x = jnp.zeros(n)
+            self.name = "a"
+
+    ws = WithStatic(3)
+    raised = False
+    try:
+        with copy_and_mutate(ws) as m:
+            m.name = "b"
+    except ValueError:
+        raised = True
+    assert raised
+    # but a static field can be changed with validation off
+    with copy_and_mutate(ws, validate=False) as m:
+        m.name = "b"
+    assert m.name == "b" and ws.name == "a"
+
+
+def test_check_init_is_bypassed():
+    # like eqx.tree_at, copy_and_mutate edits without reconstructing, so
+    # __check_init__ invariants are NOT re-enforced on exit
+    class Positive(eqx.Module):
+        a: jax.Array
+
+        def __init__(self, v):
+            self.a = jnp.asarray(v)
+
+        def __check_init__(self):
+            if float(self.a) <= 0:
+                raise ValueError("a must be positive")
+
+    p = Positive(5.0)
+    with copy_and_mutate(p, validate=False) as m:
+        m.a = jnp.asarray(-1.0)  # would violate __check_init__ if it were re-run
+    assert float(m.a) == -1.0  # no exception: the check was bypassed
+
+
+def test_converter_is_bypassed():
+    # field converters run during __init__, not on copy_and_mutate assignment
+    class Conv(eqx.Module):
+        a: jax.Array = eqx.field(converter=lambda v: 2 * jnp.asarray(v))
+
+        def __init__(self, v):
+            self.a = v
+
+    cv = Conv(5.0)
+    assert float(cv.a) == 10.0  # converter doubled at construction
+    with copy_and_mutate(cv) as m:
+        m.a = jnp.asarray(3.0)
+    assert float(m.a) == 3.0  # NOT 6.0 — converter was not reapplied
+
+
+def test_scalar_promotion_to_array_is_validated():
+    # promoting a python-int field to a jax array changes the leaf's shape/dtype
+    # (None -> ()), so default validation rejects it; validate=False allows it
+    class Step(eqx.Module):
+        x: jax.Array
+        step: int
+
+        def __init__(self):
+            self.x = jnp.zeros(2)
+            self.step = 0
+
+    s = Step()
+    raised = False
+    try:
+        with copy_and_mutate(s) as m:
+            m.step = jnp.asarray(1)  # type: ignore[assignment]
+    except ValueError:
+        raised = True
+    assert raised
+    with copy_and_mutate(s, validate=False) as m:
+        m.step = jnp.asarray(1)  # type: ignore[assignment]
+    assert int(m.step) == 1
+
+
+def test_inheritance():
+    # a Module subclass with extra fields: inherited and new fields are both
+    # mutable, and the result is the subclass
+    class Base(eqx.Module):
+        a: jax.Array
+
+        def __init__(self, n):
+            self.a = jnp.zeros(n)
+
+    class Sub(Base):
+        b: jax.Array
+
+        def __init__(self, n):
+            self.a = jnp.zeros(n)
+            self.b = jnp.ones(n)
+
+    with copy_and_mutate(Sub(3)) as m:
+        m.a = m.a.at[0].set(1.0)
+        m.b = m.b.at[0].set(2.0)
+    assert type(m) is Sub
+    assert float(m.a[0]) == 1.0 and float(m.b[0]) == 2.0
+    assert _is_frozen(m, "a") and _is_frozen(m, "b")
+
+
+def test_empty_and_all_static_modules():
+    # degenerate modules (no fields / only static fields) round-trip cleanly
+    base = _writable_count()
+
+    class Empty(eqx.Module):
+        pass
+
+    class AllStatic(eqx.Module):
+        name: str = eqx.field(static=True)
+
+        def __init__(self):
+            self.name = "hi"
+
+    with copy_and_mutate(Empty()) as e:
+        pass
+    with copy_and_mutate(AllStatic()) as s:
+        pass
+    assert type(e) is Empty and type(s) is AllStatic and s.name == "hi"
+    assert _writable_count() == base
+
+
+def test_chained_sequential_blocks():
+    # the frozen result of one block is a valid input to the next
+    base = _writable_count()
+    b = _Buf(3)
+    with copy_and_mutate(b) as a:
+        a.x = a.x.at[0].set(1.0)
+    with copy_and_mutate(a) as c:
+        c.x = c.x.at[1].set(2.0)
+        c.cursor = c.cursor + 1
+    assert float(c.x[0]) == 1.0 and float(c.x[1]) == 2.0 and int(c.cursor) == 1
+    assert float(b.x[0]) == 0.0  # the very first original is still untouched
+    assert _is_frozen(c, "cursor")
+    assert _writable_count() == base

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "eqx-cam"
-version = "0.1.0"
-description = "copy-and-mutate for Equinox modules: a context manager for ergonomic, in-place-feeling edits of frozen Equinox modules."
+version = "0.1.1"
+description = "copy-and-mutate for Equinox modules: a context manager for convenient, in-place-feeling edits of frozen Equinox modules."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
